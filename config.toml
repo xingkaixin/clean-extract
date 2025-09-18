@@ -1,0 +1,11 @@
+# config.toml
+
+# 定义需要保留的文件扩展名列表。
+# 程序会处理这些扩展名，并清理掉所有不在此列表中的文件。
+# 注意：请不要包含前面的点（.）。
+KeepExtensions = ["htm", "html", "xls", "xlsx", "pdf", "txt"]
+
+# 定义同名文件的保留优先级。
+# 列表中越靠前的扩展名，优先级越高。
+# 例如，如果同时存在 report.html 和 report.pdf，程序会保留 report.html。
+Priority = ["html", "htm", "xlsx", "xls", "txt", "pdf"]

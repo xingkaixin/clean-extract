@@ -6,3 +6,8 @@ require (
 	github.com/kdomanski/iso9660 v0.4.0
 	github.com/nwaples/rardecode v1.1.3
 )
+
+require (
+	github.com/pelletier/go-toml/v2 v2.2.4
+	golang.org/x/text v0.29.0
+)
