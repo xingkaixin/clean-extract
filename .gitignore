@@ -1,6 +1,5 @@
 .claude
 dist
-files
 *.csv
 *.log
 clean-extract

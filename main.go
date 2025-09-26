@@ -10,12 +10,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"unicode"
 	"unicode/utf8"
 	"golang.org/x/text/encoding/simplifiedchinese"
 
-	"github.com/kdomanski/iso9660"
+	"github.com/diskfs/go-diskfs"
+	"github.com/diskfs/go-diskfs/filesystem"
 	"github.com/nwaples/rardecode"
 	"github.com/pelletier/go-toml/v2"
 )
@@ -32,8 +32,10 @@ var (
 	ARCHIVE_EXTS = map[string]bool{".zip": true, ".rar": true, ".iso": true}
 	// 配置
 	config Config
-	// 日志记录器
-	logger *log.Logger
+	// 详细日志记录器（写入文件）
+	fileLogger *log.Logger
+	// 简单输出记录器（控制台）
+	consoleLogger *log.Logger
 )
 
 // --- Manifest 数据结构 ---
@@ -42,6 +44,15 @@ type ManifestEntry struct {
 	Filepath          string
 	SourceArchiveName string
 	SourceArchivePath string
+}
+
+// --- 处理统计结构 ---
+type ProcessStats struct {
+	TotalFiles    int
+	KeptFiles     int
+	RemovedFiles  int
+	Success       bool
+	ErrorMsg      string
 }
 
 // --- 配置加载 ---
@@ -61,7 +72,7 @@ func loadConfig() error {
 		copy(config.Priority, config.KeepExtensions)
 	}
 
-	logger.Printf("配置加载成功: KeepExtensions=%v, Priority=%v", config.KeepExtensions, config.Priority)
+	fileLogger.Printf("配置加载成功: KeepExtensions=%v, Priority=%v", config.KeepExtensions, config.Priority)
 	return nil
 }
 
@@ -71,10 +82,14 @@ func setupLogging() *os.File {
 	if err != nil {
 		log.Fatalf("无法创建日志文件: %v", err)
 	}
-	// 将日志同时输出到文件和控制台
-	multiWriter := io.MultiWriter(os.Stdout, logFile)
-	logger = log.New(multiWriter, "", log.LstdFlags)
-	logger.Println("日志系统已初始化。")
+
+	// 详细日志记录器（写入文件）
+	fileLogger = log.New(logFile, "", log.LstdFlags)
+	fileLogger.Println("日志系统已初始化。")
+
+	// 简单输出记录器（控制台，无时间戳）
+	consoleLogger = log.New(os.Stdout, "", 0)
+
 	return logFile
 }
 
@@ -108,8 +123,8 @@ func isKeepExtension(ext string) bool {
 }
 
 // cleanDirectory 清理目录，按优先级保留文件，移动不需要的文件到.remove目录
-func cleanDirectory(path string) {
-	logger.Printf("开始清理目录: %s", path)
+func cleanDirectory(path string) ProcessStats {
+	fileLogger.Printf("开始清理目录: %s", path)
 
 	// 第一步：收集所有文件，按目录+基础文件名分组
 	fileGroups := make(map[string][]string)
@@ -128,23 +143,23 @@ func cleanDirectory(path string) {
 				baseName := strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
 				groupKey := filepath.Join(dir, baseName)
 				fileGroups[groupKey] = append(fileGroups[groupKey], p)
-				logger.Printf("发现保留文件: %s (扩展名: %s, 分组键: %s)", p, ext, groupKey)
+				fileLogger.Printf("发现保留文件: %s (扩展名: %s, 分组键: %s)", p, ext, groupKey)
 			} else {
-				logger.Printf("发现非保留文件: %s (扩展名: %s)", p, ext)
+				fileLogger.Printf("发现非保留文件: %s (扩展名: %s)", p, ext)
 			}
 		}
 		return nil
 	})
 
-	logger.Printf("文件分组统计: %d个基础文件名有同名文件", len(fileGroups))
+	fileLogger.Printf("文件分组统计: %d个基础文件名有同名文件", len(fileGroups))
 
 	// 第二步：对每个文件组按优先级处理
 	processedFiles := make(map[string]bool)
 	for groupKey, files := range fileGroups {
-		logger.Printf("处理文件组: %s, 文件数量: %d", groupKey, len(files))
+		fileLogger.Printf("处理文件组: %s, 文件数量: %d", groupKey, len(files))
 		if len(files) == 1 {
 			processedFiles[files[0]] = true
-			logger.Printf("文件组 %s 只有一个文件，保留: %s", groupKey, files[0])
+			fileLogger.Printf("文件组 %s 只有一个文件，保留: %s", groupKey, files[0])
 			continue
 		}
 		if len(files) == 0 {
@@ -160,19 +175,19 @@ func cleanDirectory(path string) {
 			}
 		}
 
-		logger.Printf("文件组 %s 优先级排序结果:", groupKey)
+		fileLogger.Printf("文件组 %s 优先级排序结果:", groupKey)
 		for i, file := range files {
-			logger.Printf("  %d. %s (优先级: %d)", i+1, file, getFilePriority(filepath.Ext(file)))
+			fileLogger.Printf("  %d. %s (优先级: %d)", i+1, file, getFilePriority(filepath.Ext(file)))
 		}
 
 		// 保留优先级最高的文件，移动其他文件
 		keepFile := files[0]
 		processedFiles[keepFile] = true
-		logger.Printf("文件组 %s 保留文件: %s (优先级最高)", groupKey, keepFile)
+		fileLogger.Printf("文件组 %s 保留文件: %s (优先级最高)", groupKey, keepFile)
 
 		for i := 1; i < len(files); i++ {
 			processedFiles[files[i]] = true
-			logger.Printf("文件组 %s 移动文件: %s", groupKey, files[i])
+			fileLogger.Printf("文件组 %s 移动文件: %s", groupKey, files[i])
 			moveToRemove(files[i])
 		}
 	}
@@ -186,23 +201,59 @@ func cleanDirectory(path string) {
 		ext := strings.ToLower(filepath.Ext(file))
 		if !isKeepExtension(ext) {
 			nonKeepCount++
-			logger.Printf("移动非保留文件: %s", file)
+			fileLogger.Printf("移动非保留文件: %s", file)
 			moveToRemove(file)
 		}
 	}
-	logger.Printf("共处理 %d 个非保留文件", nonKeepCount)
+	fileLogger.Printf("共处理 %d 个非保留文件", nonKeepCount)
 
 	// 删除空目录
 	filepath.Walk(path, func(p string, info os.FileInfo, err error) error {
 		if info.IsDir() && p != path {
 			entries, _ := os.ReadDir(p)
 			if len(entries) == 0 {
-				logger.Printf("删除空目录: %s", p)
+				fileLogger.Printf("删除空目录: %s", p)
 				os.Remove(p)
 			}
 		}
 		return nil
 	})
+
+	// 返回统计信息
+	stats := ProcessStats{
+		TotalFiles:   len(allFiles),
+		KeptFiles:    len(allFiles) - nonKeepCount,
+		RemovedFiles:  nonKeepCount,
+		Success:      true,
+	}
+	return stats
+}
+
+// dirExistsAndHasContent 检查目录是否存在且有文件（非空）
+func dirExistsAndHasContent(dir string) bool {
+	info, err := os.Stat(dir)
+	if err != nil {
+		return false // 目录不存在
+	}
+	if !info.IsDir() {
+		return false // 不是目录
+	}
+
+	// 检查目录是否有内容
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false // 无法读取目录
+	}
+
+	// 统计非目录文件数量
+	fileCount := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			fileCount++
+		}
+	}
+
+	return fileCount > 0 // 至少有一个文件
 }
 
 // moveToRemove 将文件移动到同目录下的.remove目录
@@ -212,7 +263,7 @@ func moveToRemove(filePath string) {
 
 	// 创建.remove目录
 	if err := os.MkdirAll(removeDir, os.ModePerm); err != nil {
-		logger.Printf("错误: 无法创建.remove目录 %s: %v", removeDir, err)
+		fileLogger.Printf("错误: 无法创建.remove目录 %s: %v", removeDir, err)
 		return
 	}
 
@@ -233,23 +284,63 @@ func moveToRemove(filePath string) {
 	}
 
 	if err := os.Rename(filePath, destPath); err != nil {
-		logger.Printf("错误: 无法移动文件 %s 到 %s: %v", filePath, destPath, err)
+		fileLogger.Printf("错误: 无法移动文件 %s 到 %s: %v", filePath, destPath, err)
 		return
 	}
 
-	logger.Printf("移动文件: %s -> %s", filePath, destPath)
+	fileLogger.Printf("移动文件: %s -> %s", filePath, destPath)
 }
 
 // processArchive 是处理单个压缩文件的核心函数
-func processArchive(archivePath string, wg *sync.WaitGroup, manifestChan chan<- ManifestEntry) {
-	defer wg.Done()
+func processArchive(archivePath string) []ManifestEntry {
 
-	logger.Printf("正在处理: %s", archivePath)
+	// 控制台输出：解压开始
+	consoleLogger.Printf("解压开始: %s", filepath.Base(archivePath))
+
+	fileLogger.Printf("正在处理: %s", archivePath)
 	extractDir := strings.TrimSuffix(archivePath, filepath.Ext(archivePath))
 
+	// 检查目录是否已存在且有内容（支持手工解压后的情况）
+	if dirExistsAndHasContent(extractDir) {
+		fileLogger.Printf("目录已存在且有内容，跳过解压直接清理: %s", extractDir)
+		consoleLogger.Printf("发现已解压目录: %s", filepath.Base(archivePath))
+
+		// 直接执行清理逻辑
+		stats := cleanDirectory(extractDir)
+
+		// 收集保留的文件信息
+		var manifestEntries []ManifestEntry
+		filepath.Walk(extractDir, func(p string, info os.FileInfo, err error) error {
+			if !info.IsDir() {
+				absFilePath, err1 := filepath.Abs(p)
+				absArchivePath, err2 := filepath.Abs(archivePath)
+				if err1 != nil || err2 != nil {
+					fileLogger.Printf("警告: 无法获取绝对路径，跳过文件: %s", p)
+					return nil
+				}
+
+				manifestEntries = append(manifestEntries, ManifestEntry{
+					Filename:          info.Name(),
+					Filepath:          absFilePath,
+					SourceArchiveName: filepath.Base(archivePath),
+					SourceArchivePath: absArchivePath,
+				})
+			}
+			return nil
+		})
+
+		// 控制台输出：清理结果
+		consoleLogger.Printf("清理完成: %s (总计:%d 保留:%d 移除:%d)",
+			filepath.Base(archivePath), stats.TotalFiles, stats.KeptFiles, stats.RemovedFiles)
+
+		return manifestEntries
+	}
+
+	// 目录不存在，尝试解压
 	if err := os.MkdirAll(extractDir, os.ModePerm); err != nil {
-		logger.Printf("错误: 无法为 %s 创建解压目录: %v", archivePath, err)
-		return
+		fileLogger.Printf("错误: 无法为 %s 创建解压目录: %v", archivePath, err)
+		consoleLogger.Printf("解压失败: %s (无法创建目录)", filepath.Base(archivePath))
+		return []ManifestEntry{}
 	}
 
 	var extractErr error
@@ -263,28 +354,72 @@ func processArchive(archivePath string, wg *sync.WaitGroup, manifestChan chan<- 
 	}
 
 	if extractErr != nil {
-		logger.Printf("错误: 解压 %s 失败: %v", archivePath, extractErr)
-		return
+		fileLogger.Printf("错误: 解压 %s 失败: %v", archivePath, extractErr)
+		consoleLogger.Printf("解压失败: %s (%s)", filepath.Base(archivePath), extractErr.Error())
+
+		// 即使解压失败，如果目录已存在且有内容（手工解压），仍然执行清理
+		if dirExistsAndHasContent(extractDir) {
+			fileLogger.Printf("解压失败但目录有内容，执行清理: %s", extractDir)
+			stats := cleanDirectory(extractDir)
+
+			var manifestEntries []ManifestEntry
+			filepath.Walk(extractDir, func(p string, info os.FileInfo, err error) error {
+				if !info.IsDir() {
+					absFilePath, err1 := filepath.Abs(p)
+					absArchivePath, err2 := filepath.Abs(archivePath)
+					if err1 != nil || err2 != nil {
+						fileLogger.Printf("警告: 无法获取绝对路径，跳过文件: %s", p)
+						return nil
+					}
+
+					manifestEntries = append(manifestEntries, ManifestEntry{
+						Filename:          info.Name(),
+						Filepath:          absFilePath,
+						SourceArchiveName: filepath.Base(archivePath),
+						SourceArchivePath: absArchivePath,
+					})
+				}
+				return nil
+			})
+
+			consoleLogger.Printf("清理完成: %s (总计:%d 保留:%d 移除:%d)",
+				filepath.Base(archivePath), stats.TotalFiles, stats.KeptFiles, stats.RemovedFiles)
+			return manifestEntries
+		}
+		return []ManifestEntry{}
 	}
 
-	logger.Printf("成功解压: %s", archivePath)
-	cleanDirectory(extractDir)
+	fileLogger.Printf("成功解压: %s", archivePath)
 
-	// 收集保留的文件信息并发送到 channel
+	// 清理目录并获取统计信息
+	stats := cleanDirectory(extractDir)
+
+	// 收集保留的文件信息
+	var manifestEntries []ManifestEntry
 	filepath.Walk(extractDir, func(p string, info os.FileInfo, err error) error {
 		if !info.IsDir() {
-			absArchivePath, _ := filepath.Abs(archivePath)
-			absFilePath, _ := filepath.Abs(p)
+			absFilePath, err1 := filepath.Abs(p)
+			absArchivePath, err2 := filepath.Abs(archivePath)
+			if err1 != nil || err2 != nil {
+				fileLogger.Printf("警告: 无法获取绝对路径，跳过文件: %s", p)
+				return nil
+			}
 
-			manifestChan <- ManifestEntry{
+			manifestEntries = append(manifestEntries, ManifestEntry{
 				Filename:          info.Name(),
 				Filepath:          absFilePath,
 				SourceArchiveName: filepath.Base(archivePath),
 				SourceArchivePath: absArchivePath,
-			}
+			})
 		}
 		return nil
 	})
+
+	// 控制台输出：解压结果
+	consoleLogger.Printf("解压完成: %s (总计:%d 保留:%d 移除:%d)",
+		filepath.Base(archivePath), stats.TotalFiles, stats.KeptFiles, stats.RemovedFiles)
+
+	return manifestEntries
 }
 
 func main() {
@@ -299,10 +434,13 @@ func main() {
 
 	// 加载配置
 	if err := loadConfig(); err != nil {
-		logger.Fatalf("配置加载失败: %v", err)
+		consoleLogger.Fatalf("配置加载失败: %v", err)
 	}
 
-	logger.Println("================== 开始执行 ==================")
+	fileLogger.Println("================== 开始执行 ==================")
+
+	// 控制台输出：开始处理
+	consoleLogger.Printf("扫描目录: %s", rootDir)
 
 	var archives []string
 	filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
@@ -313,39 +451,28 @@ func main() {
 	})
 
 	if len(archives) == 0 {
-		logger.Println("在指定目录中未找到任何压缩文件。")
-		logger.Println("================== 执行完毕 ==================")
+		fileLogger.Println("在指定目录中未找到任何压缩文件。")
+		fileLogger.Println("================== 执行完毕 ==================")
+		consoleLogger.Printf("未找到任何压缩文件")
 		return
 	}
 
-	var wg sync.WaitGroup
-	manifestChan := make(chan ManifestEntry, 10000) // 更大的缓冲区
+	// 控制台输出：找到文件
+	consoleLogger.Printf("找到 %d 个压缩文件", len(archives))
 
-	// 创建并发控制器，限制 ISO 文件的并发处理
-	isoSemaphore := make(chan struct{}, 2) // 最多同时处理 2 个 ISO 文件
+	// 使用串行处理，避免内存累积
+	var manifestEntries []ManifestEntry
 
 	for _, archive := range archives {
-		archive := archive // 创建局部变量避免闭包问题
-		wg.Add(1)
-		go func() {
-			// 如果是 ISO 文件，获取信号量
-			if strings.ToLower(filepath.Ext(archive)) == ".iso" {
-				isoSemaphore <- struct{}{} // 获取信号量
-				defer func() { <-isoSemaphore }() // 释放信号量
-			}
-
-			processArchive(archive, &wg, manifestChan)
-		}()
+		// 直接处理，收集 manifest 数据
+		entries := processArchive(archive)
+		manifestEntries = append(manifestEntries, entries...)
 	}
 
-	// 等待所有解压任务完成
-	wg.Wait()
-	close(manifestChan)
-
-	// --- 收集并写入 CSV ---
+	// --- 写入 CSV ---
 	csvFile, err := os.Create("file_manifest.csv")
 	if err != nil {
-		logger.Fatalf("错误: 无法创建 CSV 文件: %v", err)
+		consoleLogger.Fatalf("错误: 无法创建 CSV 文件: %v", err)
 	}
 	defer csvFile.Close()
 
@@ -353,12 +480,16 @@ func main() {
 	defer writer.Flush()
 
 	writer.Write([]string{"filename", "filepath", "source_archive_name", "source_archive_path"})
-	for entry := range manifestChan {
+	for _, entry := range manifestEntries {
 		writer.Write([]string{entry.Filename, entry.Filepath, entry.SourceArchiveName, entry.SourceArchivePath})
 	}
 
-	logger.Println("文件清单 'file_manifest.csv' 已成功生成。")
-	logger.Println("================== 执行完毕 ==================")
+	fileLogger.Println("文件清单 'file_manifest.csv' 已成功生成。")
+	fileLogger.Println("================== 执行完毕 ==================")
+
+	// 控制台输出：完成信息
+	consoleLogger.Printf("生成文件清单: file_manifest.csv")
+	consoleLogger.Printf("所有任务完成！")
 }
 
 // decodeChineseFilename 智能解码中文字符串
@@ -509,126 +640,150 @@ func extractRar(src, dest string) error {
 }
 
 func extractIso(src, dest string) error {
-	// 检查内存使用情况，防止内存溢出
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-
-	// 如果已使用内存超过 1GB，拒绝处理大 ISO 文件
-	const maxMemoryUsage = 1024 * 1024 * 1024 // 1GB
-	if m.Alloc > maxMemoryUsage {
-		return fmt.Errorf("系统内存使用过高 (%.2f GB)，拒绝处理大 ISO 文件以防止内存溢出", float64(m.Alloc)/1024/1024/1024)
-	}
-
-	f, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	// 检查文件大小，如果超过 100MB 则警告
-	fileInfo, err := f.Stat()
+	// 检查文件大小，如果超过 2GB 则警告
+	fileInfo, err := os.Stat(src)
 	if err != nil {
 		return err
 	}
 
-	if fileInfo.Size() > 100*1024*1024 { // 100MB
-		logger.Printf("警告: 正在处理大 ISO 文件: %s (%.2f GB)", src, float64(fileInfo.Size())/1024/1024/1024)
+	if fileInfo.Size() > 2*1024*1024*1024 { // 2GB
+		fileLogger.Printf("警告: 正在处理大 ISO 文件: %s (%.2f GB)", src, float64(fileInfo.Size())/1024/1024/1024)
 	}
 
-	img, err := iso9660.OpenImage(f)
-	if err != nil {
-		return fmt.Errorf("无法打开 ISO 镜像: %w", err)
-	}
-
-	root, err := img.RootDir()
-	if err != nil {
-		return fmt.Errorf("无法获取根目录: %w", err)
-	}
-
-	// 使用新的保护性遍历函数
-	return walkIsoSafe(root, dest)
+	// 使用独立的函数处理ISO，便于捕获panic
+	return extractIsoWithRecovery(src, dest)
 }
 
-func walkIsoSafe(file *iso9660.File, path string) error {
-	// 再次检查内存使用
+func extractIsoWithRecovery(src, dest string) (err error) {
+	// 防止panic导致程序崩溃
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("ISO文件解析panic: %v", r)
+		}
+	}()
+
+	disk, err := diskfs.Open(src)
+	if err != nil {
+		return fmt.Errorf("无法打开ISO文件: %w", err)
+	}
+	// 旧版本没有Close方法，不需要defer
+
+	fs, err := disk.GetFilesystem(0) // 通常ISO只有一个分区
+	if err != nil {
+		return fmt.Errorf("无法获取文件系统: %w", err)
+	}
+
+	// 使用递归遍历，避免一次性加载所有内容
+	return walkIsoFilesystem(fs, "/", dest)
+}
+
+func walkIsoFilesystem(fs filesystem.FileSystem, path, dest string) error {
+	// 防止panic导致程序崩溃
+	defer func() {
+		if r := recover(); r != nil {
+			fileLogger.Printf("警告: ISO文件解析panic: %v，跳过此文件", r)
+		}
+	}()
+	// 在遍历前检查内存
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
-
-	// 如果内存使用过高，停止处理
-	const memoryLimit = 1 * 1024 * 1024 * 1024 // 降低到 1GB
+	const memoryLimit = 2 * 1024 * 1024 * 1024 // 2GB
 	if m.Alloc > memoryLimit {
-		return fmt.Errorf("内存使用过高 (%.2f GB)，停止处理以防止系统崩溃", float64(m.Alloc)/1024/1024/1024)
-	}
-
-	// 在 GetChildren() 调用前再次检查，这是最危险的点
-	logger.Printf("开始处理目录: %s，当前内存使用: %.2f GB", path, float64(m.Alloc)/1024/1024/1024)
-
-	children, err := file.GetChildren()
-	if err != nil {
-		return fmt.Errorf("无法获取子目录: %w", err)
-	}
-
-	// GetChildren() 后立即检查内存
-	runtime.ReadMemStats(&m)
-	if m.Alloc > memoryLimit {
-		return fmt.Errorf("GetChildren() 后内存使用过高 (%.2f GB)，停止处理", float64(m.Alloc)/1024/1024/1024)
-	}
-
-	// 限制单个目录的文件数量，防止恶意文件
-	if len(children) > 1000 {
-		logger.Printf("警告: 目录 %s 包含过多文件 (%d)，可能影响性能", path, len(children))
-	}
-
-	for _, child := range children {
-		// 检查是否应该停止处理（内存保护）
-		runtime.GC() // 手动触发垃圾回收
+		runtime.GC()
 		runtime.ReadMemStats(&m)
 		if m.Alloc > memoryLimit {
-			return fmt.Errorf("达到内存限制，停止处理")
-		}
-
-		// 智能解码中文文件名
-		childName := decodeChineseFilename(child.Name())
-		childPath := filepath.Join(path, childName)
-
-		if child.IsDir() {
-			if err := os.MkdirAll(childPath, os.ModePerm); err != nil {
-				return fmt.Errorf("无法创建目录 %s: %w", childPath, err)
-			}
-
-			if err := walkIsoSafe(child, childPath); err != nil {
-				return err
-			}
-		} else {
-			// 处理文件
-			if err := extractIsoFile(child, childPath); err != nil {
-				return err
-			}
+			return fmt.Errorf("内存使用过高 (%.2f GB)，停止遍历", float64(m.Alloc)/1024/1024/1024)
 		}
 	}
+
+	entries, err := fs.ReadDir(path)
+	if err != nil {
+		return fmt.Errorf("无法读取目录 %s: %w", path, err)
+	}
+
+	// 限制单次处理的文件数量
+	const batchSize = 50
+	for i := 0; i < len(entries); i += batchSize {
+		end := i + batchSize
+		if end > len(entries) {
+			end = len(entries)
+		}
+
+		batch := entries[i:end]
+
+		for _, entry := range batch {
+			entryPath := filepath.Join(path, entry.Name())
+
+			// 智能解码中文文件名
+			fileName := decodeChineseFilename(entry.Name())
+			targetPath := filepath.Join(dest, path, fileName)
+
+			if entry.IsDir() {
+				// 创建目录并递归处理
+				if err := os.MkdirAll(targetPath, entry.Mode()); err != nil {
+					return fmt.Errorf("无法创建目录 %s: %w", targetPath, err)
+				}
+				if err := walkIsoFilesystem(fs, entryPath, dest); err != nil {
+					return err
+				}
+			} else {
+				// 处理文件
+				if err := extractIsoFile(fs, entryPath, targetPath, entry.Size()); err != nil {
+					return err
+				}
+			}
+		}
+
+		// 每处理完一批文件后强制垃圾回收
+		runtime.GC()
+	}
+
 	return nil
 }
 
-func extractIsoFile(child *iso9660.File, destPath string) error {
-	// 检查文件大小，防止过大文件
-	if child.Size() > 100*1024*1024 { // 100MB
-		logger.Printf("警告: 跳过过大文件: %s (%.2f MB)", destPath, float64(child.Size())/1024/1024)
+// extractIsoFile 提取单个ISO文件
+func extractIsoFile(fs filesystem.FileSystem, srcPath, destPath string, fileSize int64) error {
+	// 在文件处理前检查内存
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	const memoryLimit = 2 * 1024 * 1024 * 1024 // 2GB
+	if m.Alloc > memoryLimit {
+		runtime.GC()
+		runtime.ReadMemStats(&m)
+		if m.Alloc > memoryLimit {
+			return fmt.Errorf("内存使用过高 (%.2f GB)，跳过文件 %s", float64(m.Alloc)/1024/1024/1024, destPath)
+		}
+	}
+
+	// 检查文件大小，跳过过大文件
+	const maxFileSize = 500 * 1024 * 1024 // 500MB
+	if fileSize > maxFileSize {
+		fileLogger.Printf("警告: 跳过过大文件: %s (%.2f MB)", destPath, float64(fileSize)/1024/1024)
 		return nil
 	}
 
-	f, err := os.Create(destPath)
+	// 读取文件并写入
+	srcFile, err := fs.OpenFile(srcPath, os.O_RDONLY)
 	if err != nil {
-		return fmt.Errorf("无法创建文件 %s: %w", destPath, err)
+		return fmt.Errorf("无法读取ISO内文件 %s: %w", srcPath, err)
 	}
-	defer f.Close()
+	defer srcFile.Close()
 
-	// 使用带缓冲的复制，限制内存使用
-	buf := make([]byte, 32*1024) // 32KB 缓冲区
-	_, err = io.CopyBuffer(f, child.Reader(), buf)
+	destFile, err := os.Create(destPath)
 	if err != nil {
-		return fmt.Errorf("无法写入文件 %s: %w", destPath, err)
+		return fmt.Errorf("无法创建目标文件 %s: %w", destPath, err)
 	}
+	defer destFile.Close()
 
-	return nil
+	// 使用缓冲区进行流式复制
+	buf := make([]byte, 128*1024) // 128KB 缓冲区
+	_, err = io.CopyBuffer(destFile, srcFile, buf)
+
+	// 强制垃圾回收
+	runtime.GC()
+
+	return err
 }
+
+
 
