@@ -8,8 +8,11 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 	"golang.org/x/text/encoding/simplifiedchinese"
 
 	"github.com/kdomanski/iso9660"
@@ -318,9 +321,21 @@ func main() {
 	var wg sync.WaitGroup
 	manifestChan := make(chan ManifestEntry, 10000) // 更大的缓冲区
 
+	// 创建并发控制器，限制 ISO 文件的并发处理
+	isoSemaphore := make(chan struct{}, 2) // 最多同时处理 2 个 ISO 文件
+
 	for _, archive := range archives {
+		archive := archive // 创建局部变量避免闭包问题
 		wg.Add(1)
-		go processArchive(archive, &wg, manifestChan)
+		go func() {
+			// 如果是 ISO 文件，获取信号量
+			if strings.ToLower(filepath.Ext(archive)) == ".iso" {
+				isoSemaphore <- struct{}{} // 获取信号量
+				defer func() { <-isoSemaphore }() // 释放信号量
+			}
+
+			processArchive(archive, &wg, manifestChan)
+		}()
 	}
 
 	// 等待所有解压任务完成
@@ -346,15 +361,69 @@ func main() {
 	logger.Println("================== 执行完毕 ==================")
 }
 
-// decodeChineseFilename 解码中文字符串
-func decodeChineseFilename(name string) (string, error) {
+// decodeChineseFilename 智能解码中文字符串
+func decodeChineseFilename(name string) string {
+	// 如果已经是UTF-8且能正常显示，直接返回
+	if isValidUTF8(name) && !containsGarbled(name) {
+		return name
+	}
+
 	// 尝试GB18030解码
 	decoder := simplifiedchinese.GB18030.NewDecoder()
 	decoded, err := decoder.String(name)
-	if err != nil {
-		return "", err
+	if err == nil && !containsGarbled(decoded) {
+		return decoded
 	}
-	return decoded, nil
+
+	// 如果GB18030失败，尝试GBK
+	decoder2 := simplifiedchinese.GBK.NewDecoder()
+	decoded2, err2 := decoder2.String(name)
+	if err2 == nil && !containsGarbled(decoded2) {
+		return decoded2
+	}
+
+	// 都失败则返回原字符串
+	return name
+}
+
+// isValidUTF8 检查字符串是否为有效的UTF-8
+func isValidUTF8(s string) bool {
+	return utf8.ValidString(s)
+}
+
+// containsGarbled 检查字符串是否包含明显的乱码字符
+func containsGarbled(s string) bool {
+	// 检查是否包含常见的乱码模式
+	garbledPatterns := []string{
+		"锛�", "鏃�", "骞�", "鏈�", "鐢�", "鍖�", "鍥�", "鍥�",
+		"甯�", "鐢�", "鍦�", "鍖�", "鍖�", "鍗�", "闂�", "闂�",
+	}
+
+	for _, pattern := range garbledPatterns {
+		if strings.Contains(s, pattern) {
+			return true
+		}
+	}
+
+	// 检查是否有过多的连续中文字符（可能是乱码）
+	chineseCount := 0
+	for _, r := range s {
+		if isChineseChar(r) {
+			chineseCount++
+		}
+	}
+
+	// 如果中文字符占比过高且字符串较长，可能是乱码
+	if len(s) > 10 && float64(chineseCount)/float64(len([]rune(s))) > 0.8 {
+		return true
+	}
+
+	return false
+}
+
+// isChineseChar 检查字符是否为中文字符
+func isChineseChar(r rune) bool {
+	return unicode.Is(unicode.Han, r)
 }
 
 // --- 解压函数 ---
@@ -367,11 +436,8 @@ func extractZip(src, dest string) error {
 	defer r.Close()
 
 	for _, f := range r.File {
-		// 尝试解码中文文件名
-		fileName := f.Name
-		if decodedName, err := decodeChineseFilename(f.Name); err == nil {
-			fileName = decodedName
-		}
+		// 智能解码中文文件名
+		fileName := decodeChineseFilename(f.Name)
 
 		fpath := filepath.Join(dest, fileName)
 		if f.FileInfo().IsDir() {
@@ -419,7 +485,10 @@ func extractRar(src, dest string) error {
 			return err
 		}
 
-		fpath := filepath.Join(dest, header.Name)
+		// 智能解码中文文件名
+		fileName := decodeChineseFilename(header.Name)
+		fpath := filepath.Join(dest, fileName)
+
 		if header.IsDir {
 			os.MkdirAll(fpath, os.ModePerm)
 			continue
@@ -440,46 +509,126 @@ func extractRar(src, dest string) error {
 }
 
 func extractIso(src, dest string) error {
+	// 检查内存使用情况，防止内存溢出
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	// 如果已使用内存超过 1GB，拒绝处理大 ISO 文件
+	const maxMemoryUsage = 1024 * 1024 * 1024 // 1GB
+	if m.Alloc > maxMemoryUsage {
+		return fmt.Errorf("系统内存使用过高 (%.2f GB)，拒绝处理大 ISO 文件以防止内存溢出", float64(m.Alloc)/1024/1024/1024)
+	}
+
 	f, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	img, err := iso9660.OpenImage(f)
+	// 检查文件大小，如果超过 100MB 则警告
+	fileInfo, err := f.Stat()
 	if err != nil {
 		return err
+	}
+
+	if fileInfo.Size() > 100*1024*1024 { // 100MB
+		logger.Printf("警告: 正在处理大 ISO 文件: %s (%.2f GB)", src, float64(fileInfo.Size())/1024/1024/1024)
+	}
+
+	img, err := iso9660.OpenImage(f)
+	if err != nil {
+		return fmt.Errorf("无法打开 ISO 镜像: %w", err)
 	}
 
 	root, err := img.RootDir()
 	if err != nil {
-		return err
+		return fmt.Errorf("无法获取根目录: %w", err)
 	}
 
-	return walkIso(root, dest)
+	// 使用新的保护性遍历函数
+	return walkIsoSafe(root, dest)
 }
 
-func walkIso(file *iso9660.File, path string) error {
+func walkIsoSafe(file *iso9660.File, path string) error {
+	// 再次检查内存使用
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	// 如果内存使用过高，停止处理
+	const memoryLimit = 1 * 1024 * 1024 * 1024 // 降低到 1GB
+	if m.Alloc > memoryLimit {
+		return fmt.Errorf("内存使用过高 (%.2f GB)，停止处理以防止系统崩溃", float64(m.Alloc)/1024/1024/1024)
+	}
+
+	// 在 GetChildren() 调用前再次检查，这是最危险的点
+	logger.Printf("开始处理目录: %s，当前内存使用: %.2f GB", path, float64(m.Alloc)/1024/1024/1024)
+
 	children, err := file.GetChildren()
 	if err != nil {
-		return err
+		return fmt.Errorf("无法获取子目录: %w", err)
+	}
+
+	// GetChildren() 后立即检查内存
+	runtime.ReadMemStats(&m)
+	if m.Alloc > memoryLimit {
+		return fmt.Errorf("GetChildren() 后内存使用过高 (%.2f GB)，停止处理", float64(m.Alloc)/1024/1024/1024)
+	}
+
+	// 限制单个目录的文件数量，防止恶意文件
+	if len(children) > 1000 {
+		logger.Printf("警告: 目录 %s 包含过多文件 (%d)，可能影响性能", path, len(children))
 	}
 
 	for _, child := range children {
-		childPath := filepath.Join(path, child.Name())
+		// 检查是否应该停止处理（内存保护）
+		runtime.GC() // 手动触发垃圾回收
+		runtime.ReadMemStats(&m)
+		if m.Alloc > memoryLimit {
+			return fmt.Errorf("达到内存限制，停止处理")
+		}
+
+		// 智能解码中文文件名
+		childName := decodeChineseFilename(child.Name())
+		childPath := filepath.Join(path, childName)
+
 		if child.IsDir() {
-			os.MkdirAll(childPath, os.ModePerm)
-			walkIso(child, childPath)
-		} else {
-			f, err := os.Create(childPath)
-			if err != nil {
+			if err := os.MkdirAll(childPath, os.ModePerm); err != nil {
+				return fmt.Errorf("无法创建目录 %s: %w", childPath, err)
+			}
+
+			if err := walkIsoSafe(child, childPath); err != nil {
 				return err
 			}
-			defer f.Close()
-			if _, err := io.Copy(f, child.Reader()); err != nil {
+		} else {
+			// 处理文件
+			if err := extractIsoFile(child, childPath); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
 }
+
+func extractIsoFile(child *iso9660.File, destPath string) error {
+	// 检查文件大小，防止过大文件
+	if child.Size() > 100*1024*1024 { // 100MB
+		logger.Printf("警告: 跳过过大文件: %s (%.2f MB)", destPath, float64(child.Size())/1024/1024)
+		return nil
+	}
+
+	f, err := os.Create(destPath)
+	if err != nil {
+		return fmt.Errorf("无法创建文件 %s: %w", destPath, err)
+	}
+	defer f.Close()
+
+	// 使用带缓冲的复制，限制内存使用
+	buf := make([]byte, 32*1024) // 32KB 缓冲区
+	_, err = io.CopyBuffer(f, child.Reader(), buf)
+	if err != nil {
+		return fmt.Errorf("无法写入文件 %s: %w", destPath, err)
+	}
+
+	return nil
+}
+

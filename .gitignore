@@ -4,3 +4,4 @@ files
 *.csv
 *.log
 clean-extract
+tests
