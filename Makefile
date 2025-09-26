@@ -28,7 +28,7 @@ build-all: clean
 		echo "Building $$OUTPUT..."; \
 		mkdir -p $(DIST_DIR)/$${platform%/*}/$${platform#*/}; \
 		GOOS=$${platform%/*} GOARCH=$${platform#*/} CGO_ENABLED=0 \
-		go build -ldflags="-s -w" -o $$OUTPUT . || exit 1; \
+		go build -trimpath -ldflags="-s -w" -o $$OUTPUT . || exit 1; \
 	done
 	@echo "Build completed! Files are in $(DIST_DIR)/"
 
