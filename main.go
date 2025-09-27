@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -14,8 +15,6 @@ import (
 	"unicode/utf8"
 	"golang.org/x/text/encoding/simplifiedchinese"
 
-	"github.com/diskfs/go-diskfs"
-	"github.com/diskfs/go-diskfs/filesystem"
 	"github.com/nwaples/rardecode"
 	"github.com/pelletier/go-toml/v2"
 )
@@ -557,6 +556,7 @@ func isChineseChar(r rune) bool {
 	return unicode.Is(unicode.Han, r)
 }
 
+
 // --- 解压函数 ---
 
 func extractZip(src, dest string) error {
@@ -639,7 +639,71 @@ func extractRar(src, dest string) error {
 	return nil
 }
 
-func extractIso(src, dest string) error {
+// get7zCommand 获取适用于当前操作系统的7z命令
+func get7zCommand() string {
+	// 根据操作系统确定7z命令名称
+	switch runtime.GOOS {
+	case "windows":
+		return "7z.exe"
+	case "darwin":
+		// macOS优先尝试7z，如果没有可以尝试7za
+		return "7z"
+	default:
+		// Linux和其他系统
+		return "7z"
+	}
+}
+
+// extractWith7z 使用7z命令处理ISO文件
+func extractWith7z(src, dest string) error {
+	// 确保目标目录存在
+	if err := os.MkdirAll(dest, 0755); err != nil {
+		return fmt.Errorf("无法创建目标目录: %w", err)
+	}
+
+	// 获取适用于当前系统的7z命令
+	sevenZipCmd := get7zCommand()
+
+	// 检查7z命令是否存在
+	if _, err := exec.LookPath(sevenZipCmd); err != nil {
+		// 如果7z不存在，尝试替代方案
+		altCmd := getAlternative7zCommand(sevenZipCmd)
+		if altCmd == "" {
+			return fmt.Errorf("未找到7z命令，请安装7-Zip或p7zip")
+		}
+		sevenZipCmd = altCmd
+		fileLogger.Printf("使用替代7z命令: %s", sevenZipCmd)
+	}
+
+	// 使用7z命令解压
+	cmd := exec.Command(sevenZipCmd, "x", src, fmt.Sprintf("-o%s", dest), "-y")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%s解压失败: %w, 输出: %s", sevenZipCmd, err, string(output))
+	}
+
+	// 记录7z输出以便调试
+	if len(output) > 0 {
+		fileLogger.Printf("%s输出: %s", sevenZipCmd, string(output))
+	}
+
+	return nil
+}
+
+// getAlternative7zCommand 获取替代的7z命令
+func getAlternative7zCommand(_ string) string {
+	switch runtime.GOOS {
+	case "darwin", "linux":
+		// 尝试7za作为替代
+		if _, err := exec.LookPath("7za"); err == nil {
+			return "7za"
+		}
+	}
+	return ""
+}
+
+
+	func extractIso(src, dest string) error {
 	// 检查文件大小，如果超过 2GB 则警告
 	fileInfo, err := os.Stat(src)
 	if err != nil {
@@ -650,140 +714,8 @@ func extractIso(src, dest string) error {
 		fileLogger.Printf("警告: 正在处理大 ISO 文件: %s (%.2f GB)", src, float64(fileInfo.Size())/1024/1024/1024)
 	}
 
-	// 使用独立的函数处理ISO，便于捕获panic
-	return extractIsoWithRecovery(src, dest)
+	// 直接使用7z处理所有ISO文件
+	consoleLogger.Printf("使用7z解析器: %s", filepath.Base(src))
+	fileLogger.Printf("使用7z解析器处理: %s", src)
+	return extractWith7z(src, dest)
 }
-
-func extractIsoWithRecovery(src, dest string) (err error) {
-	// 防止panic导致程序崩溃
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("ISO文件解析panic: %v", r)
-		}
-	}()
-
-	disk, err := diskfs.Open(src)
-	if err != nil {
-		return fmt.Errorf("无法打开ISO文件: %w", err)
-	}
-	// 旧版本没有Close方法，不需要defer
-
-	fs, err := disk.GetFilesystem(0) // 通常ISO只有一个分区
-	if err != nil {
-		return fmt.Errorf("无法获取文件系统: %w", err)
-	}
-
-	// 使用递归遍历，避免一次性加载所有内容
-	return walkIsoFilesystem(fs, "/", dest)
-}
-
-func walkIsoFilesystem(fs filesystem.FileSystem, path, dest string) error {
-	// 防止panic导致程序崩溃
-	defer func() {
-		if r := recover(); r != nil {
-			fileLogger.Printf("警告: ISO文件解析panic: %v，跳过此文件", r)
-		}
-	}()
-	// 在遍历前检查内存
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	const memoryLimit = 2 * 1024 * 1024 * 1024 // 2GB
-	if m.Alloc > memoryLimit {
-		runtime.GC()
-		runtime.ReadMemStats(&m)
-		if m.Alloc > memoryLimit {
-			return fmt.Errorf("内存使用过高 (%.2f GB)，停止遍历", float64(m.Alloc)/1024/1024/1024)
-		}
-	}
-
-	entries, err := fs.ReadDir(path)
-	if err != nil {
-		return fmt.Errorf("无法读取目录 %s: %w", path, err)
-	}
-
-	// 限制单次处理的文件数量
-	const batchSize = 50
-	for i := 0; i < len(entries); i += batchSize {
-		end := i + batchSize
-		if end > len(entries) {
-			end = len(entries)
-		}
-
-		batch := entries[i:end]
-
-		for _, entry := range batch {
-			entryPath := filepath.Join(path, entry.Name())
-
-			// 智能解码中文文件名
-			fileName := decodeChineseFilename(entry.Name())
-			targetPath := filepath.Join(dest, path, fileName)
-
-			if entry.IsDir() {
-				// 创建目录并递归处理
-				if err := os.MkdirAll(targetPath, entry.Mode()); err != nil {
-					return fmt.Errorf("无法创建目录 %s: %w", targetPath, err)
-				}
-				if err := walkIsoFilesystem(fs, entryPath, dest); err != nil {
-					return err
-				}
-			} else {
-				// 处理文件
-				if err := extractIsoFile(fs, entryPath, targetPath, entry.Size()); err != nil {
-					return err
-				}
-			}
-		}
-
-		// 每处理完一批文件后强制垃圾回收
-		runtime.GC()
-	}
-
-	return nil
-}
-
-// extractIsoFile 提取单个ISO文件
-func extractIsoFile(fs filesystem.FileSystem, srcPath, destPath string, fileSize int64) error {
-	// 在文件处理前检查内存
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	const memoryLimit = 2 * 1024 * 1024 * 1024 // 2GB
-	if m.Alloc > memoryLimit {
-		runtime.GC()
-		runtime.ReadMemStats(&m)
-		if m.Alloc > memoryLimit {
-			return fmt.Errorf("内存使用过高 (%.2f GB)，跳过文件 %s", float64(m.Alloc)/1024/1024/1024, destPath)
-		}
-	}
-
-	// 检查文件大小，跳过过大文件
-	const maxFileSize = 500 * 1024 * 1024 // 500MB
-	if fileSize > maxFileSize {
-		fileLogger.Printf("警告: 跳过过大文件: %s (%.2f MB)", destPath, float64(fileSize)/1024/1024)
-		return nil
-	}
-
-	// 读取文件并写入
-	srcFile, err := fs.OpenFile(srcPath, os.O_RDONLY)
-	if err != nil {
-		return fmt.Errorf("无法读取ISO内文件 %s: %w", srcPath, err)
-	}
-	defer srcFile.Close()
-
-	destFile, err := os.Create(destPath)
-	if err != nil {
-		return fmt.Errorf("无法创建目标文件 %s: %w", destPath, err)
-	}
-	defer destFile.Close()
-
-	// 使用缓冲区进行流式复制
-	buf := make([]byte, 128*1024) // 128KB 缓冲区
-	_, err = io.CopyBuffer(destFile, srcFile, buf)
-
-	// 强制垃圾回收
-	runtime.GC()
-
-	return err
-}
-
-
-
