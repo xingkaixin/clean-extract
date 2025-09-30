@@ -57,7 +57,6 @@ make build-all
 
 这会编译所有平台版本到dist目录：
 - `dist/windows/amd64/clean-extract.exe`
-- `dist/linux/amd64/clean-extract`
 - `dist/darwin/arm64/clean-extract` 等
 
 用 `make clean` 清理构建产物。
@@ -89,3 +88,25 @@ Priority = ["pdf", "xlsx", "xls", "html", "htm"]  # 可选，优先级顺序
 - **Linux**: `7z` → `7za` (备用)
 
 如果找不到7z命令，工具会给出清晰的错误提示。
+
+## 文档
+
+详细的技术文档请参考：
+
+### 📋 规格文档
+- **[项目概述](docs/spec/overview.md)** - 项目简介、核心功能和设计原则
+- **[架构设计](docs/spec/architecture.md)** - 模块化架构和设计模式
+- **[API接口](docs/spec/api.md)** - 命令行接口和核心函数文档
+- **[配置规格](docs/spec/configuration.md)** - 配置文件格式和最佳实践
+- **[数据流设计](docs/spec/dataflow.md)** - 处理流程和数据流向分析
+
+### 🔧 开发文档
+- **代码结构** - 7个专门模块的职责分工
+- **性能优化** - 内存管理和磁盘I/O优化策略
+- **错误处理** - 异常处理和恢复机制
+- **扩展指南** - 如何添加新功能和支持新的压缩格式
+
+### 📈 维护指南
+- **配置管理** - 不同环境的配置模板
+- **故障排除** - 常见问题和解决方案
+- **监控审计** - 日志分析和性能监控
