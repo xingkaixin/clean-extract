@@ -7,11 +7,6 @@ DIST_DIR := dist
 # 目标平台列表
 PLATFORMS := \
 	windows/amd64 \
-	windows/386 \
-	linux/amd64 \
-	linux/386 \
-	linux/arm64 \
-	darwin/amd64 \
 	darwin/arm64
 
 # 默认目标
